@@ -63,8 +63,18 @@ Respond in this JSON format:
         "temperature": 0.7,
         "max_tokens": 1000
     }
+
     res = requests.post(endpoint, headers=headers, json=payload)
-    return json.loads(res.json()["choices"][0]["message"]["content"])
+    if res.status_code == 200:
+        try:
+            reply = res.json()["choices"][0]["message"]["content"]
+            return json.loads(reply)
+        except:
+            st.error("⚠️ Failed to parse JSON from GPT-4 Vision.")
+            return None
+    else:
+        st.error(f"❌ GPT-4 Vision failed: {res.status_code}\n{res.text}")
+        return None
 
 # ========================
 # 🎨 Generate and Upload DALL·E Images
@@ -73,7 +83,7 @@ def generate_and_upload_images(result):
     s3 = boto3.client("s3", aws_access_key_id=AWS_ACCESS_KEY,
                            aws_secret_access_key=AWS_SECRET_KEY,
                            region_name=AWS_REGION)
-    slug = result["storytitle"].lower().replace(" ", "-").replace(":", "")
+    slug = result["storytitle"].lower().replace(" ", "-").replace(":", "").replace(".", "")
     final_json = result.copy()
 
     for i in range(1, 7):
@@ -82,10 +92,17 @@ def generate_and_upload_images(result):
         headers = {"Content-Type": "application/json", "api-key": DALE_API_KEY}
         payload = {"prompt": prompt, "n": 1, "size": "1024x1024"}
 
+        image_url = None
         for _ in range(3):
             res = requests.post(url, headers=headers, json=payload)
             if res.status_code == 200:
                 image_url = res.json()["data"][0]["url"]
+                break
+            elif res.status_code == 429:
+                time.sleep(10)
+
+        if image_url:
+            try:
                 img = Image.open(BytesIO(requests.get(image_url).content)).convert("RGB").resize((720, 1200))
                 buffer = BytesIO()
                 img.save(buffer, format="JPEG")
@@ -93,16 +110,17 @@ def generate_and_upload_images(result):
                 key = f"{S3_PREFIX}{slug}/slide{i}.jpg"
                 s3.upload_fileobj(buffer, AWS_BUCKET, key)
                 final_json[f"s{i}image1"] = f"{CDN_BASE}{key}"
-                break
-            time.sleep(5)
+            except:
+                final_json[f"s{i}image1"] = DEFAULT_ERROR_IMAGE
         else:
             final_json[f"s{i}image1"] = DEFAULT_ERROR_IMAGE
 
-    # Portrait Cover
+    # Portrait Cover (from s1image1)
     try:
-        portrait = Image.open(BytesIO(requests.get(final_json["s1image1"]).content)).convert("RGB").resize((640, 853))
+        s1_url = final_json["s1image1"]
+        img = Image.open(BytesIO(requests.get(s1_url).content)).convert("RGB").resize((640, 853))
         buffer = BytesIO()
-        portrait.save(buffer, format="JPEG")
+        img.save(buffer, format="JPEG")
         buffer.seek(0)
         portrait_key = f"{S3_PREFIX}{slug}/portrait_cover.jpg"
         s3.upload_fileobj(buffer, AWS_BUCKET, portrait_key)
@@ -140,8 +158,15 @@ Respond as:
         "temperature": 0.5,
         "max_tokens": 300
     }
+
     res = requests.post(endpoint, headers=headers, json=payload)
-    return json.loads(res.json()["choices"][0]["message"]["content"])
+    if res.status_code == 200:
+        try:
+            return json.loads(res.json()["choices"][0]["message"]["content"])
+        except:
+            return {"metadescription": "Explore this story.", "metakeywords": "web story, inspiration"}
+    else:
+        return {"metadescription": "Explore this story.", "metakeywords": "web story, inspiration"}
 
 # ========================
 # 💻 Streamlit App (Tab 1)
@@ -160,16 +185,19 @@ with tabs[0]:
         with st.spinner("⏳ Generating content using GPT-4 Vision..."):
             result = call_gpt4_vision(base64_img)
 
-        with st.spinner("🎨 Generating images and uploading to S3..."):
-            final_json = generate_and_upload_images(result)
+        if result:
+            with st.spinner("🎨 Generating images and uploading to S3..."):
+                final_json = generate_and_upload_images(result)
 
-        with st.spinner("✍️ Generating SEO metadata..."):
-            seo_data = generate_seo(final_json)
-            final_json.update(seo_data)
+            with st.spinner("✍️ Generating SEO metadata..."):
+                seo_data = generate_seo(final_json)
+                final_json.update(seo_data)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_filename = f"{result['storytitle'].replace(' ', '_').lower()}_{timestamp}.json"
-        json_str = json.dumps(final_json, indent=2)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            json_filename = f"{result['storytitle'].replace(' ', '_').lower()}_{timestamp}.json"
+            json_str = json.dumps(final_json, indent=2)
 
-        st.success("✅ JSON generated successfully!")
-        st.download_button("📥 Download JSON", data=json_str, file_name=json_filename, mime="application/json")
+            st.success("✅ JSON generated successfully!")
+            st.download_button("📥 Download JSON", data=json_str, file_name=json_filename, mime="application/json")
+        else:
+            st.error("⚠️ GPT-4 Vision did not return valid content.")
